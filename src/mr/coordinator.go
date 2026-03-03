@@ -5,15 +5,88 @@ import "net"
 import "os"
 import "net/rpc"
 import "net/http"
+import "sync"
+import "time"
 
+type TaskStatus int
+
+const(
+	Idle = iota
+	Running
+	Done
+)
+
+type Task struct{
+	TaskId int
+	FileName string
+	Status TaskStatus
+	StartTime time.Time
+}
+
+type Phase int
+
+const(
+	MapPhase = iota
+	ReducePhase
+	AllDone
+)
 
 type Coordinator struct {
 	// Your definitions here.
+	
+	mapTasks []Task
+	reduceTasks []Task
+	phase Phase
+	mu sync.Mutex
 
 }
 
 // Your code here -- RPC handlers for the worker to call.
+func (c *Coordinator) AssignTask(args *TaskArgs,reply *TaskReply)error{
 
+	c.mu.Lock()
+    defer c.mu.Unlock()
+
+	if c.phase == AllDone{
+		reply.TaskType = "Exit"
+		return nil
+	}
+	if c.phase == MapPhase{
+		for i := range c.mapTasks{
+			task := &c.mapTasks[i]
+
+			if task.Status == Idle{
+				task.Status = Running
+				task.StartTime = time.Now()
+
+				reply.TaskType = "Map"
+				reply.TaskId = task.TaskId
+				reply.FileName = task.FileName
+				reply.NReduce = len(c.reduceTasks)
+				return nil
+			}
+		}
+		reply.TaskType = "Wait"
+		return nil	
+	}
+	if c.phase == ReducePhase{
+		for i := range c.reduceTasks{
+			task := &c.reduceTasks[i]
+
+			if task.Status == Idle{
+				task.Status = Running
+				task.StartTime = time.Now()
+
+				reply.TaskType = "Reduce"
+				reply.TaskId = task.TaskId
+				return nil
+		}
+	}
+		reply.TaskType = "Wait"
+		return nil
+	}
+	return nil	
+}
 // an example RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
@@ -53,7 +126,16 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 	c := Coordinator{}
 
 	// Your code here.
+	c.phase = MapPhase
+	for i ,file := range files{
+		task := Task{
+			TaskId : i
+    		FileName : file
+			Status : Idle
+		}
 
+		c.mapTasks = c.MapTask.append(task)
+	}
 
 	c.server(sockname)
 	return &c
