@@ -1,31 +1,33 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-import "sync"
-import "time"
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
 type TaskStatus int
 
-const(
+const (
 	Idle = iota
 	Running
 	Done
 )
 
-type Task struct{
-	TaskId int
-	FileName string
-	Status TaskStatus
+type Task struct {
+	TaskId    int
+	FileName  string
+	Status    TaskStatus
 	StartTime time.Time
 }
 
 type Phase int
 
-const(
+const (
 	MapPhase = iota
 	ReducePhase
 	AllDone
@@ -33,29 +35,40 @@ const(
 
 type Coordinator struct {
 	// Your definitions here.
-	
-	mapTasks []Task
-	reduceTasks []Task
-	phase Phase
-	mu sync.Mutex
 
+	mapTasks    []Task
+	reduceTasks []Task
+	phase       Phase
+	mu          sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) AssignTask(args *TaskArgs,reply *TaskReply)error{
+func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 
 	c.mu.Lock()
-    defer c.mu.Unlock()
+	defer c.mu.Unlock()
 
-	if c.phase == AllDone{
+	for i := range c.mapTasks {
+		if c.mapTasks[i].Status == Running && time.Since(c.mapTasks[i].StartTime) > 10*time.Second {
+			c.mapTasks[i].Status = Idle
+		}
+	}
+
+	for i := range c.reduceTasks {
+		if c.reduceTasks[i].Status == Running && time.Since(c.reduceTasks[i].StartTime) > 10*time.Second {
+			c.reduceTasks[i].Status = Idle
+		}
+	}
+
+	if c.phase == AllDone {
 		reply.TaskType = "Exit"
 		return nil
 	}
-	if c.phase == MapPhase{
-		for i := range c.mapTasks{
+	if c.phase == MapPhase {
+		for i := range c.mapTasks {
 			task := &c.mapTasks[i]
 
-			if task.Status == Idle{
+			if task.Status == Idle {
 				task.Status = Running
 				task.StartTime = time.Now()
 
@@ -67,26 +80,29 @@ func (c *Coordinator) AssignTask(args *TaskArgs,reply *TaskReply)error{
 			}
 		}
 		reply.TaskType = "Wait"
-		return nil	
+		return nil
 	}
-	if c.phase == ReducePhase{
-		for i := range c.reduceTasks{
+	if c.phase == ReducePhase {
+		for i := range c.reduceTasks {
 			task := &c.reduceTasks[i]
 
-			if task.Status == Idle{
+			if task.Status == Idle {
 				task.Status = Running
 				task.StartTime = time.Now()
 
 				reply.TaskType = "Reduce"
 				reply.TaskId = task.TaskId
+				reply.NReduce = len(c.reduceTasks)
+				reply.NMap = len(c.mapTasks)
 				return nil
 			}
 		}
 		reply.TaskType = "Wait"
 		return nil
 	}
-	return nil	
+	return nil
 }
+
 // an example RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
@@ -94,7 +110,6 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
-
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server(sockname string) {
@@ -109,33 +124,33 @@ func (c *Coordinator) server(sockname string) {
 }
 func allTasksDone(tasks []Task) bool {
 	for _, t := range tasks {
-		if t.Status != Done{
-		return false
-			}
+		if t.Status != Done {
+			return false
 		}
+	}
 	return true
 }
-func (c *Coordinator) TaskDone(args *TaskDoneArgs,reply *TaskDoneReply)error
-{
+func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.phase == MapPhase{
-		if args.TaskId >= 0 && args.TaskId < len(c.mapTasks){
+	if c.phase == MapPhase {
+		if args.TaskId >= 0 && args.TaskId < len(c.mapTasks) {
 			c.mapTasks[args.TaskId].Status = Done
 		}
-	if allTasksDone(c.mapTasks){
-		c.Phase = ReducePhase
-	}
-	}else if c.Phase == ReducePhase{
-		if args.TaskId >= 0 && args.TaskId < len(c.reduceTasks){
+		if allTasksDone(c.mapTasks) {
+			c.phase = ReducePhase
+		}
+	} else if c.phase == ReducePhase {
+		if args.TaskId >= 0 && args.TaskId < len(c.reduceTasks) {
 			c.reduceTasks[args.TaskId].Status = Done
 		}
-	if allTasksDone(c.reduceTasks){
-		c.Phase = AllDone
+		if allTasksDone(c.reduceTasks) {
+			c.phase = AllDone
 		}
 	}
 	return nil
 }
+
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
@@ -144,7 +159,7 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-	if c.phase == AllDone{
+	if c.phase == AllDone {
 		ret = true
 	}
 
@@ -159,16 +174,23 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 
 	// Your code here.
 	c.phase = MapPhase
-	for i ,file := range files{
+	for i, file := range files {
 		task := Task{
-			TaskId : i
-    		FileName : file
-			Status : Idle
+			TaskId:   i,
+			FileName: file,
+			Status:   Idle,
 		}
 
-		c.mapTasks = c.MapTask.append(task)
+		c.mapTasks = append(c.mapTasks, task)
 	}
 
+	for i := 0; i < nReduce; i++ {
+		task := Task{
+			TaskId: i,
+			Status: Idle,
+		}
+		c.reduceTasks = append(c.reduceTasks, task)
+	}
 	c.server(sockname)
 	return &c
 }

@@ -36,6 +36,7 @@ type TaskReply struct {
 	TaskId   int
 	FileName string
 	NReduce  int
+	NMap     int
 }
 
 type TaskDoneArgs struct {
