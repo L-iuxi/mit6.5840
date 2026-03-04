@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -21,6 +22,9 @@ func ihash(key string) int {
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
+func doMap(reply *TaskReply, mapf func(string, string)) {
+
+}
 
 var coordSockName string // socket for coordinator
 
@@ -31,7 +35,39 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	coordSockName = sockname
 
 	for {
+		args := TaskArgs{}
+		reply := TaskReply{}
 
+		ok := call("Coordinator.AssignTask", &args, &reply)
+
+		if !ok {
+			fmt.Printf("call failed!\n")
+			return
+		}
+
+		switch reply.TaskType {
+		case "Map":
+			doMap(reply, mapf)
+
+			doneArgs := TaskDoneArgs{
+				TaskType: "Map",
+				TaskId:   reply.TaskId,
+			}
+			call("Coordinator.TaskDone", &doneArgs, &TaskDoneReply{})
+		case "Reduce":
+			doReduce(reply, reducef)
+
+			doneArgs := TaskDoneArgs{
+				TaskType: "Reduce",
+				TaskId:   reply.TaskId,
+			}
+			call("Coordinator.TaskDone", &doneArgs, &TaskDoneReply{})
+		case "Wait":
+			time.Sleep(time.Second)
+		case "Exit":
+			return
+
+		}
 	}
 
 }

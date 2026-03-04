@@ -80,8 +80,8 @@ func (c *Coordinator) AssignTask(args *TaskArgs,reply *TaskReply)error{
 				reply.TaskType = "Reduce"
 				reply.TaskId = task.TaskId
 				return nil
+			}
 		}
-	}
 		reply.TaskType = "Wait"
 		return nil
 	}
@@ -107,14 +107,46 @@ func (c *Coordinator) server(sockname string) {
 	}
 	go http.Serve(l, nil)
 }
-
+func allTasksDone(tasks []Task) bool {
+	for _, t := range tasks {
+		if t.Status != Done{
+		return false
+			}
+		}
+	return true
+}
+func (c *Coordinator) TaskDone(args *TaskDoneArgs,reply *TaskDoneReply)error
+{
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.phase == MapPhase{
+		if args.TaskId >= 0 && args.TaskId < len(c.mapTasks){
+			c.mapTasks[args.TaskId].Status = Done
+		}
+	if allTasksDone(c.mapTasks){
+		c.Phase = ReducePhase
+	}
+	}else if c.Phase == ReducePhase{
+		if args.TaskId >= 0 && args.TaskId < len(c.reduceTasks){
+			c.reduceTasks[args.TaskId].Status = Done
+		}
+	if allTasksDone(c.reduceTasks){
+		c.Phase = AllDone
+		}
+	}
+	return nil
+}
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	ret := false
 
 	// Your code here.
-
+	if c.phase == AllDone{
+		ret = true
+	}
 
 	return ret
 }

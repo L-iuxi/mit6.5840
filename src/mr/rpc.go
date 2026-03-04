@@ -37,3 +37,10 @@ type TaskReply struct {
 	FileName string
 	NReduce  int
 }
+
+type TaskDoneArgs struct {
+	TaskType TaskType
+	TaskId   int
+}
+
+type TaskDoneReply struct{}
