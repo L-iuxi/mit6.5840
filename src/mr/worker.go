@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -22,7 +23,30 @@ func ihash(key string) int {
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
-func doMap(reply *TaskReply, mapf func(string, string)) {
+func doMap(reply TaskReply, mapf func(string, string) []KeyValue) {
+	content, _ := os.ReadFile(reply.FileName)
+	kva := mapf(reply.FileName, string(content))
+	files := make([]*os.File, reply.NReduce)
+	encoders := make([]*json.Encoder, reply.NReduce)
+	for i := 0; i < reply.NReduce; i++ {
+		f, _ := os.CreateTemp("", "mr-map-*")
+		files[i] = f
+		encoders[i] = json.NewEncoder(f)
+	}
+
+	for _, kv := range kva {
+		idx := ihash(kv.Key) % reply.NReduce
+		encoders[idx].Encode(kv)
+	}
+	for _, f := range files {
+		f.Close()
+	}
+	for i := 0; i < reply.NReduce; i++ {
+		finalName := fmt.Sprintf("mr-%d-%d", reply.TaskId, i)
+		os.Rename(files[i].Name(), finalName)
+	}
+}
+func doReduce(reply TaskReply, reducef func(string, []string) string) {
 
 }
 
