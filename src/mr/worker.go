@@ -84,7 +84,8 @@ func doReduce(reply TaskReply, reducef func(string, []string) string) {
 		j := i + 1
 		for j < len(kva) && kva[j].Key == kva[i].Key {
 			j++
-		}
+		}cd ../main
+go run mrcoordinator.go pg-*.txt
 
 		values := []string{}
 

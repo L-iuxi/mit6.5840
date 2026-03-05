@@ -6,7 +6,7 @@ import (
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 const Debug = false
@@ -18,22 +18,39 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type KVServer struct {
 	mu sync.Mutex
-
+	kv map[string]ValueVersion
 	// Your definitions here.
+}
+
+type Tversion uint64
+type ValueVersion struct {
+	Value   string
+	Version Tversion
 }
 
 func MakeKVServer() *KVServer {
 	kv := &KVServer{}
-	// Your code here.
+	kv.kv = make(map[string]ValueVersion)
 	return kv
 }
 
 // Get returns the value and version for args.Key, if args.Key
 // exists. Otherwise, Get returns ErrNoKey.
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	v, ok := kv.kv[args.Key]
+	if !ok {
+		reply.Err = rpc.ErrNoKey
+		return
+	}
+
+	reply.Value = v.Value
+	reply.Version = v.Version
+	reply.Err = rpc.OK
 	// Your code here.
 }
 
@@ -44,8 +61,6 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	// Your code here.
 }
-
-
 
 // You can ignore all arguments; they are for replicated KVservers
 func StartKVServer(tc *tester.TesterClnt, ends []*labrpc.ClientEnd, gid tester.Tgid, srv int, persister *tester.Persister) []any {
