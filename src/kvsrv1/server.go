@@ -18,9 +18,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type Requestinf struct {
+	RequestId rpc.Id
+	Reply     rpc.PutReply
+}
+
 type KVServer struct {
-	mu sync.Mutex
-	kv map[string]ValueVersion
+	mu          sync.Mutex
+	kv          map[string]ValueVersion
+	lastRequest map[rpc.Id]Requestinf
 	// Your definitions here.
 }
 
@@ -32,6 +38,7 @@ type ValueVersion struct {
 func MakeKVServer() *KVServer {
 	kv := &KVServer{}
 	kv.kv = make(map[string]ValueVersion)
+	kv.lastRequest = make(map[rpc.Id]Requestinf)
 	return kv
 }
 
@@ -60,11 +67,16 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+	if args.RequestId <= kv.lastRequest[args.ClientId].RequestId {
+		reply.Err = kv.lastRequest[args.ClientId].Reply.Err
+		return
+	}
+
 	v, ok := kv.kv[args.Key]
 	if !ok {
 		if args.Version != 0 {
 			reply.Err = rpc.ErrNoKey
-			return
 		}
 
 		kv.kv[args.Key] = ValueVersion{
@@ -73,20 +85,23 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 		}
 
 		reply.Err = rpc.OK
-		return
-	}
-
-	if args.Version != v.Version {
+	} else if args.Version != v.Version {
 		reply.Err = rpc.ErrVersion
-		return
+	} else {
+		kv.kv[args.Key] = ValueVersion{
+			Value:   args.Value,
+			Version: args.Version + 1,
+		}
+
+		reply.Err = rpc.OK
 	}
 
-	kv.kv[args.Key] = ValueVersion{
-		Value:   args.Value,
-		Version: args.Version + 1,
+	kv.lastRequest[args.ClientId] = Requestinf{
+		RequestId: args.RequestId,
+		Reply: rpc.PutReply{
+			Err: reply.Err,
+		},
 	}
-	reply.Err = rpc.OK
-	// Your code here.
 }
 
 // You can ignore all arguments; they are for replicated KVservers

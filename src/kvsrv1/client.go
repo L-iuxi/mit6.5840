@@ -1,18 +1,25 @@
 package kvsrv
 
 import (
+	"math/rand"
+
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	tester "6.5840/tester1"
 )
 
 type Clerk struct {
-	clnt   *tester.Clnt
-	server string
+	clnt      *tester.Clnt
+	server    string
+	clientId  rpc.Id
+	requestId rpc.Id
 }
 
 func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, server: server}
+
+	ck.clientId = rpc.Id(rand.Int())
+	ck.requestId = 0
 	// You may add code here.
 	return ck
 }
@@ -61,30 +68,32 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
+
 	args := rpc.PutArgs{}
 	args.Key = key
 	args.Value = value
 	args.Version = version
+	args.ClientId = ck.clientId
+	args.RequestId = ck.requestId
+	ck.requestId++
 
 	first := true
 	for {
 		reply := rpc.PutReply{}
 		ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
 
-		if !ok {
-			if first {
-				first = false
-				continue
+		if ok {
+			if reply.Err == rpc.ErrVersion {
+				if first {
+					return rpc.ErrVersion
+				}
+				return rpc.ErrMaybe
 			}
+			return reply.Err
+		}
+		if !first {
 			return rpc.ErrMaybe
 		}
-
-		if reply.Err == rpc.ErrVersion {
-			if first {
-				return reply.Err
-			}
-			return rpc.ErrMaybe
-		}
-		return reply.Err
+		first = false
 	}
 }
