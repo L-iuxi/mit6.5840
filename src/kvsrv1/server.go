@@ -24,10 +24,9 @@ type KVServer struct {
 	// Your definitions here.
 }
 
-type Tversion uint64
 type ValueVersion struct {
 	Value   string
-	Version Tversion
+	Version rpc.Tversion
 }
 
 func MakeKVServer() *KVServer {
@@ -59,6 +58,34 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 // If the key doesn't exist, Put installs the value if the
 // args.Version is 0, and returns ErrNoKey otherwise.
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	v, ok := kv.kv[args.Key]
+	if !ok {
+		if args.Version != 0 {
+			reply.Err = rpc.ErrNoKey
+			return
+		}
+
+		kv.kv[args.Key] = ValueVersion{
+			Value:   args.Value,
+			Version: 1,
+		}
+
+		reply.Err = rpc.OK
+		return
+	}
+
+	if args.Version != v.Version {
+		reply.Err = rpc.ErrVersion
+		return
+	}
+
+	kv.kv[args.Key] = ValueVersion{
+		Value:   args.Value,
+		Version: args.Version + 1,
+	}
+	reply.Err = rpc.OK
 	// Your code here.
 }
 
