@@ -91,9 +91,10 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 			}
 			return reply.Err
 		}
-		if !first {
-			return rpc.ErrMaybe
-		}
+
+		// if !first {
+		// 	return rpc.ErrMaybe
+		// }
 		first = false
 	}
 }

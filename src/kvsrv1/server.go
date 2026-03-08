@@ -20,13 +20,13 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 
 type Requestinf struct {
 	RequestId rpc.Id
-	Reply     rpc.PutReply
+	Err       rpc.Err
 }
 
 type KVServer struct {
 	mu          sync.Mutex
 	kv          map[string]ValueVersion
-	lastRequest map[rpc.Id]Requestinf
+	lastRequest map[rpc.Id]rpc.Id
 	// Your definitions here.
 }
 
@@ -38,7 +38,7 @@ type ValueVersion struct {
 func MakeKVServer() *KVServer {
 	kv := &KVServer{}
 	kv.kv = make(map[string]ValueVersion)
-	kv.lastRequest = make(map[rpc.Id]Requestinf)
+	kv.lastRequest = make(map[rpc.Id]rpc.Id)
 	return kv
 }
 
@@ -68,15 +68,29 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	if args.RequestId <= kv.lastRequest[args.ClientId].RequestId {
-		reply.Err = kv.lastRequest[args.ClientId].Reply.Err
-		return
+	if len(kv.lastRequest) > 100000 {
+		kv.lastRequest = make(map[rpc.Id]rpc.Id)
 	}
+
+	if last, ok := kv.lastRequest[args.ClientId]; ok {
+		if args.RequestId <= last {
+			reply.Err = rpc.OK
+			return
+		}
+	}
+
+	// if last, ok := kv.lastRequest[args.ClientId]; ok {
+	// 	if args.RequestId <= last.RequestId {
+	// 		reply.Err = last.Err
+	// 		return
+	// 	}
+	// }
 
 	v, ok := kv.kv[args.Key]
 	if !ok {
 		if args.Version != 0 {
 			reply.Err = rpc.ErrNoKey
+			return
 		}
 
 		kv.kv[args.Key] = ValueVersion{
@@ -96,11 +110,12 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 		reply.Err = rpc.OK
 	}
 
-	kv.lastRequest[args.ClientId] = Requestinf{
-		RequestId: args.RequestId,
-		Reply: rpc.PutReply{
-			Err: reply.Err,
-		},
+	// kv.lastRequest[args.ClientId] = Requestinf{
+	// 	RequestId: args.RequestId,
+	// 	Err:       reply.Err,
+	// }
+	if reply.Err == rpc.OK {
+		kv.lastRequest[args.ClientId] = args.RequestId
 	}
 }
 
