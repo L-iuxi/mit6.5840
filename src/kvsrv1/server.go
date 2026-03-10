@@ -2,6 +2,8 @@ package kvsrv
 
 import (
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 
 	"6.5840/kvsrv1/rpc"
@@ -24,9 +26,9 @@ type Requestinf struct {
 }
 
 type KVServer struct {
-	mu sync.Mutex
-	kv map[string]ValueVersion
-	// lastRequest map[rpc.Id]rpc.Id
+	mu       sync.Mutex
+	kv       map[string]ValueVersion
+	lastLock map[string]rpc.Id
 	// Your definitions here.
 }
 
@@ -68,16 +70,19 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// if len(kv.lastRequest) > 100000 {
-	// 	kv.lastRequest = make(map[rpc.Id]rpc.Id)
-	// }
+	isLock := strings.HasPrefix(args.Key, "lock-")
 
-	// if last, ok := kv.lastRequest[args.ClientId]; ok {
-	// 	if args.RequestId <= last {
-	// 		reply.Err = rpc.OK
-	// 		return
-	// 	}
-	// }
+	if isLock {
+		if kv.lastLock == nil {
+			kv.lastLock = make(map[string]rpc.Id)
+		}
+
+		lockKey := args.Key + "-" + strconv.Itoa(int(args.ClientId))
+		if last, ok := kv.lastLock[lockKey]; ok && args.RequestId <= last {
+			reply.Err = rpc.OK
+			return
+		}
+	}
 
 	v, ok := kv.kv[args.Key]
 	if !ok {
@@ -86,6 +91,10 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 			return
 		}
 
+		if _, exists := kv.kv[args.Key]; exists {
+			reply.Err = rpc.ErrVersion
+			return
+		}
 		kv.kv[args.Key] = ValueVersion{
 			Value:   args.Value,
 			Version: 1,
@@ -103,13 +112,10 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 		reply.Err = rpc.OK
 	}
 
-	// kv.lastRequest[args.ClientId] = Requestinf{
-	// 	RequestId: args.RequestId,
-	// 	Err:       reply.Err,
-	// }
-	// if reply.Err == rpc.OK {
-	// kv.lastRequest[args.ClientId] = args.RequestId
-	// // }
+	if isLock && reply.Err == rpc.OK {
+		lockKey := args.Key + "-" + strconv.Itoa(int(args.ClientId))
+		kv.lastLock[lockKey] = args.RequestId
+	}
 }
 
 // You can ignore all arguments; they are for replicated KVservers

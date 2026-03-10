@@ -1,6 +1,11 @@
 package lock
 
 import (
+	"math/rand"
+	"strconv"
+	"time"
+
+	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 )
 
@@ -15,6 +20,9 @@ type Lock struct {
 	// You may add code here
 }
 
+// var clientCounter int
+// var clientMu sync.Mutex
+
 // The tester calls MakeLock() and passes in a k/v clerk; your code can
 // perform a Put or Get by calling lk.ck.Put() or lk.ck.Get().
 //
@@ -22,36 +30,61 @@ type Lock struct {
 // lockname argument; locks with different names should be
 // independent.
 func MakeLock(ck kvtest.IKVClerk, lockname string) *Lock {
+	// clientMu.Lock()
+	// clientCounter++
+	// id := clientCounter
+	// clientMu.Unlock()
+	rand.Seed(time.Now().UnixNano())
+
 	lk := &Lock{ck: ck,
-		lockName: lockname}
+		lockName: "lock-" + lockname,
+		clientId: "client-" + strconv.Itoa(rand.Int()),
+	}
 	// You may add code here
 	return lk
 }
 
 func (lk *Lock) Acquire() {
-	// for {
+	for {
 
-	// 	ok, _, _ := lk.ck.Get(lk.lockName)
+		value, version, err := lk.ck.Get(lk.lockName)
 
-	// 	if ok != "" {
-	// 		time.Sleep(10 * time.Millisecond)
-	// 		continue
-	// 	}
+		if err == rpc.ErrNoKey {
+			version = 0
+			value = ""
+		}
 
-	// 	value := lk.clientId
-	// 	lk.ck.Put(lk.lockName, value, 0)
+		if value != "" {
+			time.Sleep(8 * time.Millisecond)
+			continue
+		}
 
-	// 	k, _, _ := lk.ck.Get(lk.lockName)
-
-	// 	if k == lk.clientId {
-	// 		return
-	// 	}
-
-	// 	time.Sleep(10 * time.Millisecond)
-	// }
+		err = lk.ck.Put(lk.lockName, lk.clientId, version)
+		if err == rpc.OK {
+			return
+		}
+		if err == rpc.ErrMaybe {
+			v, _, err2 := lk.ck.Get(lk.lockName)
+			if err2 == rpc.OK && v == lk.clientId {
+				return
+			}
+		}
+		time.Sleep(8 * time.Millisecond)
+	}
 }
 
 func (lk *Lock) Release() {
-	// lk.ck.Put(lk.lockName, "", 0)
+	for {
+		value, version, err := lk.ck.Get(lk.lockName)
+		if err != rpc.OK || value != lk.clientId {
+			return
+		}
 
+		err = lk.ck.Put(lk.lockName, "", version)
+		if err == rpc.OK {
+			return
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
 }
