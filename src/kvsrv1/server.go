@@ -24,9 +24,9 @@ type Requestinf struct {
 }
 
 type KVServer struct {
-	mu          sync.Mutex
-	kv          map[string]ValueVersion
-	lastRequest map[rpc.Id]rpc.Id
+	mu sync.Mutex
+	kv map[string]ValueVersion
+	// lastRequest map[rpc.Id]rpc.Id
 	// Your definitions here.
 }
 
@@ -38,7 +38,7 @@ type ValueVersion struct {
 func MakeKVServer() *KVServer {
 	kv := &KVServer{}
 	kv.kv = make(map[string]ValueVersion)
-	kv.lastRequest = make(map[rpc.Id]rpc.Id)
+	// kv.lastRequest = make(map[rpc.Id]rpc.Id)
 	return kv
 }
 
@@ -68,20 +68,13 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	if len(kv.lastRequest) > 100000 {
-		kv.lastRequest = make(map[rpc.Id]rpc.Id)
-	}
-
-	if last, ok := kv.lastRequest[args.ClientId]; ok {
-		if args.RequestId <= last {
-			reply.Err = rpc.OK
-			return
-		}
-	}
+	// if len(kv.lastRequest) > 100000 {
+	// 	kv.lastRequest = make(map[rpc.Id]rpc.Id)
+	// }
 
 	// if last, ok := kv.lastRequest[args.ClientId]; ok {
-	// 	if args.RequestId <= last.RequestId {
-	// 		reply.Err = last.Err
+	// 	if args.RequestId <= last {
+	// 		reply.Err = rpc.OK
 	// 		return
 	// 	}
 	// }
@@ -114,9 +107,9 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	// 	RequestId: args.RequestId,
 	// 	Err:       reply.Err,
 	// }
-	if reply.Err == rpc.OK {
-		kv.lastRequest[args.ClientId] = args.RequestId
-	}
+	// if reply.Err == rpc.OK {
+	// kv.lastRequest[args.ClientId] = args.RequestId
+	// // }
 }
 
 // You can ignore all arguments; they are for replicated KVservers
