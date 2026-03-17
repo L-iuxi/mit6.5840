@@ -78,10 +78,12 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 	}
 
 	rf.overElectiontime.Reset(time.Duration(150+rand.Intn(150)) * time.Millisecond)
-	rf.state = Follower
+
 	if args.Leaderterm > rf.currentTerm {
 		rf.currentTerm = args.Leaderterm
+		rf.VoteFor = -1
 	}
+	rf.state = Follower
 
 	reply.Success = true
 	reply.Term = rf.currentTerm
@@ -183,6 +185,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		rf.VoteFor = args.CandidateId
 		reply.IsVote = 1
+		rf.overElectiontime.Reset(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 	}
 	reply.Term = rf.currentTerm
 }
@@ -248,55 +251,71 @@ func (rf *Raft) ticker() {
 		switch rf.state {
 
 		case Candidate: //选举者发送选举
-
-			time.Sleep(50 * time.Millisecond)
-			rf.mu.Lock()
-			if rf.state != Candidate {
+			select {
+			case <-rf.overElectiontime.C:
+				rf.mu.Lock()
+				rf.state = Candidate
 				rf.mu.Unlock()
-				continue
-			}
 
-			rf.currentTerm++
-			rf.VoteFor = rf.me
-			rf.overElectiontime.Reset(time.Duration(150+rand.Intn(150)) * time.Millisecond)
-			args := &RequestVoteArgs{}
-			args.CandidateId = rf.me
-			args.Term = rf.currentTerm
-			votes := 1
-			rf.mu.Unlock()
-			//finished := 1
-			for n := range rf.peers {
-				if n != rf.me {
-					go func(i int) {
-						reply := &RequestVoteReply{}
-						ok := rf.sendRequestVote(i, args, reply)
-
-						rf.mu.Lock()
-						defer rf.mu.Unlock()
-
-						if !ok {
-							return
-						}
-
-						if reply.Term > rf.currentTerm {
-							rf.currentTerm = reply.Term
-							rf.state = Follower
-							rf.VoteFor = -1
-							return
-						}
-
-						if rf.state != Candidate {
-							return
-						}
-
-						if reply.IsVote == 1 && reply.Term == rf.currentTerm {
-							votes++
-							if votes > len(rf.peers)/2 && rf.state == Candidate {
-								rf.state = Leader
-							}
-						}
-					}(n)
+				// time.Sleep(50 * time.Millisecond)
+				rf.mu.Lock()
+				if rf.state != Candidate {
+					rf.mu.Unlock()
+					continue
 				}
+
+				rf.currentTerm++
+				rf.VoteFor = rf.me
+				rf.overElectiontime.Reset(time.Duration(150+rand.Intn(150)) * time.Millisecond)
+				args := &RequestVoteArgs{}
+				args.CandidateId = rf.me
+				args.Term = rf.currentTerm
+				votes := 1
+				rf.mu.Unlock()
+				//finished := 1
+				for n := range rf.peers {
+					if n != rf.me {
+						go func(i int) {
+							reply := &RequestVoteReply{}
+							ok := rf.sendRequestVote(i, args, reply)
+
+							rf.mu.Lock()
+
+							if !ok {
+								rf.mu.Unlock()
+								return
+							}
+
+							if reply.Term > rf.currentTerm {
+								rf.currentTerm = reply.Term
+								rf.state = Follower
+								rf.VoteFor = -1
+								rf.mu.Unlock()
+								return
+							}
+
+							if rf.state != Candidate {
+								rf.mu.Unlock()
+								return
+							}
+
+							if reply.Term != rf.currentTerm {
+								rf.mu.Unlock()
+								return
+							}
+
+							if reply.IsVote == 1 && reply.Term == rf.currentTerm {
+								votes++
+								if votes > len(rf.peers)/2 && rf.state == Candidate {
+									rf.state = Leader
+								}
+							}
+							rf.mu.Unlock()
+						}(n)
+					}
+				}
+			default:
+
 			}
 		case Follower:
 			select {
@@ -305,38 +324,98 @@ func (rf *Raft) ticker() {
 				rf.mu.Lock()
 				rf.state = Candidate
 				rf.mu.Unlock()
+
+				// time.Sleep(50 * time.Millisecond)
+				rf.mu.Lock()
+				if rf.state != Candidate {
+					rf.mu.Unlock()
+					continue
+				}
+
+				rf.currentTerm++
+				rf.VoteFor = rf.me
+				rf.overElectiontime.Reset(time.Duration(150+rand.Intn(150)) * time.Millisecond)
+				args := &RequestVoteArgs{}
+				args.CandidateId = rf.me
+				args.Term = rf.currentTerm
+				votes := 1
+				rf.mu.Unlock()
+				//finished := 1
+				for n := range rf.peers {
+					if n != rf.me {
+						go func(i int) {
+							reply := &RequestVoteReply{}
+							ok := rf.sendRequestVote(i, args, reply)
+
+							rf.mu.Lock()
+
+							if !ok {
+								rf.mu.Unlock()
+								return
+							}
+
+							if reply.Term > rf.currentTerm {
+								rf.currentTerm = reply.Term
+								rf.state = Follower
+								rf.VoteFor = -1
+								rf.mu.Unlock()
+								return
+							}
+
+							if rf.state != Candidate {
+								rf.mu.Unlock()
+								return
+							}
+
+							if reply.Term != rf.currentTerm {
+								rf.mu.Unlock()
+								return
+							}
+
+							if reply.IsVote == 1 && reply.Term == rf.currentTerm {
+								votes++
+								if votes > len(rf.peers)/2 && rf.state == Candidate {
+									rf.state = Leader
+								}
+							}
+							rf.mu.Unlock()
+						}(n)
+					}
+				}
 			default:
 			}
 		case Leader:
 
-			rf.mu.Lock()
-			args := &HeartbeatArgs{
-				LeaderId:   rf.me,
-				Leaderterm: rf.currentTerm,
-			}
-			rf.mu.Unlock()
-
-			for n := range rf.peers {
-				if n != rf.me {
-					go func(i int) {
-						reply := &HeartbeatReply{}
-						rf.SendAppendEntries(i, args, reply) //发送心跳
-
-						if reply.Term > rf.currentTerm {
-							rf.mu.Lock()
-							rf.currentTerm = reply.Term
-							rf.state = Follower
-							rf.VoteFor = -1
-							rf.mu.Unlock()
-						}
-					}(n)
-
+			select {
+			case <-rf.heartbeat.C:
+				rf.mu.Lock()
+				args := &HeartbeatArgs{
+					LeaderId:   rf.me,
+					Leaderterm: rf.currentTerm,
 				}
-			}
-		}
-		//ms := 50 + (rand.Int63() % 300)
-		time.Sleep(50 * time.Millisecond)
+				rf.mu.Unlock()
 
+				for n := range rf.peers {
+					if n != rf.me {
+						go func(i int) {
+							reply := &HeartbeatReply{}
+							rf.SendAppendEntries(i, args, reply) //发送心跳
+
+							if reply.Term > rf.currentTerm {
+								rf.mu.Lock()
+								rf.currentTerm = reply.Term
+								rf.state = Follower
+								rf.VoteFor = -1
+								rf.mu.Unlock()
+							}
+						}(n)
+					}
+				}
+				rf.heartbeat.Reset(50 * time.Millisecond)
+			}
+			//ms := 50 + (rand.Int63() % 300)
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
 }
 
