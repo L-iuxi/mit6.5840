@@ -344,10 +344,9 @@ func (rf *Raft) ticker() {
 				for n := range rf.peers {
 					if n != rf.me {
 						go func(i int) {
+							rf.mu.Lock()
 							reply := &RequestVoteReply{}
 							ok := rf.sendRequestVote(i, args, reply)
-
-							rf.mu.Lock()
 
 							if !ok {
 								rf.mu.Unlock()
