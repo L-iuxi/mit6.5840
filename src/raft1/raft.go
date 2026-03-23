@@ -28,6 +28,11 @@ const (
 	Leader    = "Leader"
 )
 
+type loginf struct {
+	term    int
+	command interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu               sync.Mutex          // 保护访问此peer的共享访问（包括投票和当前任期）
@@ -36,14 +41,12 @@ type Raft struct {
 	me               int                 // 当前节点在peers[]中的索引
 	state            serverState         // 当前节点的状态（Follower、Candidate或Leader）
 	currentTerm      int                 // 当前任期号
-	log              []any               // 日志条目，包含命令和任期号
+	log              []loginf            // 日志条目，包含命令和任期号
 	VoteFor          int
 	heartbeat        *time.Timer //心跳超时
 	overElectiontime *time.Timer //选举超时
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
 // 获取当前节点任期与是否是leader
 func (rf *Raft) GetState() (int, bool) {
 
