@@ -46,7 +46,8 @@ type Raft struct {
 	heartbeat        *time.Timer //心跳超时
 	overElectiontime *time.Timer //选举超时
 
-	nextIndex []int //日志同步的位置
+	nextIndex []int //日志同步的位置（从哪里开始同步日志
+
 }
 
 // 获取当前节点任期与是否是leader
@@ -67,9 +68,11 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 type HeartbeatArgs struct {
-	LeaderId   int
-	Leaderterm int
-	Entries    []loginf
+	LeaderId    int
+	Leaderterm  int
+	Entries     []loginf
+	prelogIndex int //最后对齐位置
+	prelogTerm  int //最后对齐位置的任期
 }
 
 type HeartbeatReply struct {
@@ -103,11 +106,7 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 
 func (rf *Raft) SendAppendEntries(server int, args *HeartbeatArgs, reply *HeartbeatReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if reply.Success {
-		rf.nextIndex[server]++
-	} else {
-		rf.nextIndex[server]-- //找最后一个一样的节点
-	}
+
 	return ok
 }
 
@@ -354,15 +353,19 @@ func (rf *Raft) ticker() {
 							if votes > len(rf.peers)/2 && rf.state == Candidate {
 
 								rf.state = Leader
+
 								rf.heartbeat.Reset(0)
 								// 当选为leader之后立刻发一次心跳告诉所有人
 								args := &HeartbeatArgs{
-									LeaderId:   rf.me,
-									Leaderterm: rf.currentTerm,
-									Entries:    rf.log[rf.nextIndex[i]:], //只发送未同步的日志
+									LeaderId:    rf.me,
+									Leaderterm:  rf.currentTerm,
+									Entries:     rf.log[rf.nextIndex[i]:], //只发送未同步的日志
+									prelogIndex: rf.prelogIndex,
+									prelogTerm:  rf.prelogTerm,
 								}
 
 								for j := range rf.peers {
+									rf.nextIndex[j] = len(rf.log)
 									if j != rf.me {
 										go func(peer int) {
 											reply := &HeartbeatReply{}
@@ -388,9 +391,11 @@ func (rf *Raft) ticker() {
 
 							rf.mu.Lock()
 							args := &HeartbeatArgs{
-								LeaderId:   rf.me,
-								Leaderterm: rf.currentTerm,
-								Entries:    rf.log[rf.nextIndex[i]:], //只发送未同步的日志
+								LeaderId:    rf.me,
+								Leaderterm:  rf.currentTerm,
+								Entries:     rf.log[rf.nextIndex[i]:], //只发送未同步的日志
+								prelogIndex: rf.prelogIndex,
+								prelogTerm:  rf.prelogTerm,
 							}
 							rf.mu.Unlock()
 
@@ -406,6 +411,13 @@ func (rf *Raft) ticker() {
 							if rf.state != Leader || args.Leaderterm != rf.currentTerm {
 								return
 							}
+
+							if reply.Success {
+								rf.nextIndex[i]++
+							} else {
+								rf.nextIndex[i]-- //找最后一个一样的节点
+							}
+
 							if reply.Term > rf.currentTerm { //自己的任期号小了，别人是leader
 								rf.currentTerm = reply.Term
 								rf.state = Follower
@@ -442,6 +454,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.state = Follower
 	rf.currentTerm = 0
+
 	rf.VoteFor = -1
 	rf.overElectiontime = time.NewTimer(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 	rf.heartbeat = time.NewTimer(50 * time.Millisecond)
