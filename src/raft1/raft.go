@@ -46,8 +46,11 @@ type Raft struct {
 	heartbeat        *time.Timer //心跳超时
 	overElectiontime *time.Timer //选举超时
 
-	nextIndex []int //日志同步的位置（从哪里开始同步日志
+	nextIndex   []int //日志同步的位置（从哪里开始同步日志
+	commitIndex int   //提交成功的日志
+	matchIndex  []int
 
+	lastApplied int //上次commit
 }
 
 // 获取当前节点任期与是否是leader
@@ -109,9 +112,13 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 		reply.Success = false
 		return
 	}
-	rf.log = rf.log[:args.PreLogIndex+1]
-
-	rf.log = append(rf.log, args.Entries...) //follower复制日志
+	if args.PreLogIndex < 0 {
+		// leader 还没日志，直接覆盖
+		rf.log = args.Entries
+	} else {
+		rf.log = rf.log[:args.PreLogIndex+1]
+		rf.log = append(rf.log, args.Entries...) //同步日志
+	}
 
 	reply.Success = true
 	reply.Term = rf.currentTerm
@@ -290,7 +297,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.log = append(rf.log, newcomm)
 
-	return index, term, isleader
+	return index - 1, term, isleader
 }
 
 // 无限循环接受心跳，心跳失败发送选举
@@ -406,7 +413,7 @@ func (rf *Raft) ticker() {
 
 			select {
 			case <-rf.heartbeat.C:
-
+				// count := 1
 				for n := range rf.peers {
 					if n != rf.me { //给除自己以外的所有发送心跳
 						go func(i int) {
@@ -445,8 +452,25 @@ func (rf *Raft) ticker() {
 
 							if reply.Success {
 								rf.nextIndex[i] = args.PreLogIndex + len(args.Entries) + 1
+								//成功对齐日志，记录成功数
+								rf.matchIndex[i] = rf.nextIndex[i] - 1
+								for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+
+									count := 1 // leader 自己
+
+									for j := range rf.peers {
+										if j != rf.me && rf.matchIndex[j] >= N {
+											count++
+										}
+									}
+
+									if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
+										rf.commitIndex = N
+										break
+									}
+								}
 							} else {
-								rf.nextIndex[i]-- //找最后一个一样的节点
+								rf.nextIndex[i] = max(0, rf.nextIndex[i]-1) //找最后一个一样的节点
 							}
 
 							if reply.Term > rf.currentTerm { //自己的任期号小了，别人是leader
@@ -454,6 +478,7 @@ func (rf *Raft) ticker() {
 								rf.state = Follower
 								rf.VoteFor = -1
 							}
+
 						}(n)
 					}
 				}
@@ -487,6 +512,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.nextIndex = make([]int, len(peers))
 	rf.VoteFor = -1
+	rf.matchIndex = make([]int, len(peers))
+	rf.commitIndex = -1
+	rf.lastApplied = -1
 	rf.overElectiontime = time.NewTimer(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 	rf.heartbeat = time.NewTimer(50 * time.Millisecond)
 	//rf.heartbeat
@@ -495,6 +523,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	go func() {
+		for {
+			var msgs []raftapi.ApplyMsg
+			rf.mu.Lock()
+			for rf.lastApplied < rf.commitIndex {
+				rf.lastApplied++
+				msgs = append(msgs, raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied].Command,
+					CommandIndex: rf.lastApplied,
+				})
+			}
+			rf.mu.Unlock()
+			for _, msg := range msgs {
+				applyCh <- msg
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
 
 	//开始检查心跳，发起选举
 	go rf.ticker()
