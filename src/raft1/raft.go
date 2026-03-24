@@ -248,14 +248,28 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 // 执行客户端发来的指令（是leader的话，不是直接返回-1让客户端继续找别的服务器）
+// 复制日志
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (3B).
+	term := rf.currentTerm
+	index := len(rf.log) //日志编号
+	isleader := true
 
-	return index, term, isLeader
+	if rf.state != Leader {
+		isleader = false
+		return -1, term, isleader
+	} //不是leader不复制
+
+	newcomm := loginf{
+		term:    rf.currentTerm,
+		command: command,
+	}
+	rf.log = append(rf.log, newcomm)
+	//让其他raft复制日志
+
+	return index, term, isleader
 }
 
 // 无限循环接受心跳，心跳失败发送选举
