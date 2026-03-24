@@ -45,6 +45,8 @@ type Raft struct {
 	VoteFor          int
 	heartbeat        *time.Timer //心跳超时
 	overElectiontime *time.Timer //选举超时
+
+	nextIndex []int //日志同步的位置
 }
 
 // 获取当前节点任期与是否是leader
@@ -101,6 +103,11 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 
 func (rf *Raft) SendAppendEntries(server int, args *HeartbeatArgs, reply *HeartbeatReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if reply.Success {
+		rf.nextIndex[server]++
+	} else {
+		rf.nextIndex[server]-- //找最后一个一样的节点
+	}
 	return ok
 }
 
@@ -352,7 +359,7 @@ func (rf *Raft) ticker() {
 								args := &HeartbeatArgs{
 									LeaderId:   rf.me,
 									Leaderterm: rf.currentTerm,
-									Entries:    rf.log,
+									Entries:    rf.log[rf.nextIndex[i]:], //只发送未同步的日志
 								}
 
 								for j := range rf.peers {
@@ -374,16 +381,19 @@ func (rf *Raft) ticker() {
 
 			select {
 			case <-rf.heartbeat.C:
-				rf.mu.Lock()
-				args := &HeartbeatArgs{
-					LeaderId:   rf.me,
-					Leaderterm: rf.currentTerm,
-				}
-				rf.mu.Unlock()
 
 				for n := range rf.peers {
 					if n != rf.me { //给除自己以外的所有发送心跳
 						go func(i int) {
+
+							rf.mu.Lock()
+							args := &HeartbeatArgs{
+								LeaderId:   rf.me,
+								Leaderterm: rf.currentTerm,
+								Entries:    rf.log[rf.nextIndex[i]:], //只发送未同步的日志
+							}
+							rf.mu.Unlock()
+
 							reply := &HeartbeatReply{}
 							ok := rf.SendAppendEntries(i, args, reply)
 							if !ok {
