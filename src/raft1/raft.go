@@ -67,6 +67,7 @@ func (rf *Raft) GetState() (int, bool) {
 type HeartbeatArgs struct {
 	LeaderId   int
 	Leaderterm int
+	Entries    []loginf
 }
 
 type HeartbeatReply struct {
@@ -78,7 +79,7 @@ type HeartbeatReply struct {
 func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Leaderterm < rf.currentTerm {
+	if args.Leaderterm < rf.currentTerm { //leader任期落后
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
@@ -86,13 +87,15 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 
 	rf.overElectiontime.Reset(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 
-	if args.Leaderterm > rf.currentTerm {
+	if args.Leaderterm > rf.currentTerm { //自己落后，更新任期
 		rf.currentTerm = args.Leaderterm
 		rf.VoteFor = -1
 	}
 	rf.state = Follower
 
 	reply.Success = true
+	rf.log = append(rf.log, args.Entries...) //follower复制日志
+
 	reply.Term = rf.currentTerm
 }
 
@@ -349,6 +352,7 @@ func (rf *Raft) ticker() {
 								args := &HeartbeatArgs{
 									LeaderId:   rf.me,
 									Leaderterm: rf.currentTerm,
+									Entries:    rf.log,
 								}
 
 								for j := range rf.peers {
