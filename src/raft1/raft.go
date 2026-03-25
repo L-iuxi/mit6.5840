@@ -86,6 +86,70 @@ type HeartbeatReply struct {
 	Term    int
 }
 
+func (rf *Raft) broadcastAppendEntries() {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		go func(peer int) {
+			rf.mu.Lock()
+			next := rf.nextIndex[peer]
+			prevIndex := next - 1
+			var prevTerm int
+			if prevIndex >= 0 {
+				prevTerm = rf.log[prevIndex].Term
+			}
+			entries := make([]LogInf, len(rf.log[next:]))
+			copy(entries, rf.log[next:])
+			args := &HeartbeatArgs{
+				LeaderId:          rf.me,
+				LeaderTerm:        rf.currentTerm,
+				Entries:           entries,
+				PreLogIndex:       prevIndex,
+				PreLogTerm:        prevTerm,
+				LeaderCommitIndex: rf.commitIndex,
+			}
+			rf.mu.Unlock()
+
+			reply := &HeartbeatReply{}
+			ok := rf.SendAppendEntries(peer, args, reply)
+			if !ok {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Success {
+				rf.nextIndex[peer] = args.PreLogIndex + len(args.Entries) + 1
+				rf.matchIndex[peer] = args.PreLogIndex + len(args.Entries)
+				// 更新 commitIndex
+				for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+					count := 1
+					for j := range rf.peers {
+						if j != rf.me && rf.matchIndex[j] >= N {
+							count++
+						}
+					}
+					if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
+						rf.commitIndex = N
+						break
+					}
+				}
+			} else {
+				rf.nextIndex[peer] = max(0, rf.nextIndex[peer]-1)
+			}
+
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.state = Follower
+				rf.VoteFor = -1
+				rf.persist()
+			}
+		}(i)
+	}
+}
+
 // 发送心跳
 func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 	rf.mu.Lock()
@@ -143,7 +207,7 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 				rf.persist()
 				break
 			}
-			rf.persist()
+
 		}
 
 		// rf.log = rf.log[:args.PreLogIndex+1]
@@ -156,7 +220,7 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 	// 		rf.log = rf.log[:newLen]
 	// 	}
 	// }
-
+	rf.persist()
 	reply.Success = true
 	reply.Term = rf.currentTerm
 }
@@ -351,6 +415,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.log = append(rf.log, newcomm)
 	rf.persist()
+	go rf.broadcastAppendEntries()
 
 	return index, term, isleader
 }
