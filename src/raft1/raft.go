@@ -10,11 +10,13 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -99,6 +101,7 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 	if args.LeaderTerm > rf.currentTerm { //自己落后，更新任期
 		rf.currentTerm = args.LeaderTerm
 		rf.VoteFor = -1
+		rf.persist()
 	}
 	rf.state = Follower
 
@@ -121,6 +124,7 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 	if args.PreLogIndex < 0 {
 		// leader 还没日志，直接覆盖
 		rf.log = args.Entries
+		rf.persist()
 	} else {
 		//查重
 		index := args.PreLogIndex + 1
@@ -131,12 +135,15 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 
 					rf.log = rf.log[:index+i] //从当前开始覆盖后面所有
 					rf.log = append(rf.log, args.Entries[i:]...)
+					rf.persist()
 					break
 				}
 			} else {
 				rf.log = append(rf.log, args.Entries[i:]...)
+				rf.persist()
 				break
 			}
+			rf.persist()
 		}
 
 		// rf.log = rf.log[:args.PreLogIndex+1]
@@ -169,35 +176,38 @@ func (rf *Raft) SendAppendEntries(server int, args *HeartbeatArgs, reply *Heartb
 // (or nil if there's not yet a snapshot).
 // 持久化保存当前raft状态，防止节点崩溃
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.log)
+	e.Encode(rf.VoteFor)
+	e.Encode(rf.currentTerm)
+
+	raftState := w.Bytes()
+	rf.persister.Save(raftState, nil)
+
 }
 
-// restore previously persisted state.
-// 重新更新持久化信息
+// 解码持久化信息
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var Log []LogInf
+	var Term int
+	var Vote int
+
+	if d.Decode(&Log) != nil || d.Decode(&Vote) != nil || d.Decode(&Term) != nil {
+		//解码失败
+	} else {
+		rf.log = Log
+		rf.VoteFor = Vote
+		rf.currentTerm = Term
+	}
+
 }
 
 // how many bytes in Raft's persisted log?
@@ -256,6 +266,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.VoteFor = -1
 		rf.state = Follower
+		rf.persist()
 	}
 
 	if args.Term < rf.currentTerm { //版本号小了，不投票
@@ -269,6 +280,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		rf.VoteFor = args.CandidateId
 		reply.IsVote = 1
+		rf.persist()
 		rf.overElectiontime.Reset(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 	}
 	reply.Term = rf.currentTerm
@@ -338,6 +350,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.log = append(rf.log, newcomm)
+	rf.persist()
 
 	return index, term, isleader
 }
@@ -354,7 +367,7 @@ func (rf *Raft) ticker() {
 			select {
 			case <-rf.overElectiontime.C: //触发超时选举
 
-				rf.mu.Lock()
+				rf.mu.Lock() //锁
 
 				rf.state = Candidate
 				rf.currentTerm++
@@ -363,6 +376,7 @@ func (rf *Raft) ticker() {
 				term := rf.currentTerm
 				me := rf.me
 
+				rf.persist()
 				// 重置选举超时
 				if !rf.overElectiontime.Stop() {
 					select {
@@ -373,6 +387,8 @@ func (rf *Raft) ticker() {
 				rf.overElectiontime.Reset(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 
 				votes := 1
+				lastIndex := len(rf.log) - 1
+				lastTerm := rf.log[lastIndex].Term
 				rf.mu.Unlock()
 
 				for i := range rf.peers {
@@ -381,11 +397,12 @@ func (rf *Raft) ticker() {
 					}
 
 					go func(server int) {
+
 						args := &RequestVoteArgs{
 							Term:         term,
 							CandidateId:  me,
-							LastLogIndex: len(rf.log) - 1,
-							LastLogTerm:  rf.log[len(rf.log)-1].Term,
+							LastLogIndex: lastIndex,
+							LastLogTerm:  lastTerm,
 						}
 						reply := &RequestVoteReply{}
 
@@ -395,10 +412,10 @@ func (rf *Raft) ticker() {
 						}
 
 						rf.mu.Lock()
-						defer rf.mu.Unlock()
 
 						// 过滤旧term
 						if rf.state != Candidate || rf.currentTerm != term {
+							rf.mu.Unlock()
 							return
 						}
 
@@ -407,47 +424,59 @@ func (rf *Raft) ticker() {
 							rf.currentTerm = reply.Term
 							rf.state = Follower
 							rf.VoteFor = -1
+							rf.persist()
+							rf.mu.Unlock()
 							return
 						}
-
+						rf.mu.Unlock()
 						if reply.IsVote == 1 {
+
+							rf.mu.Lock()
 							votes++
 
 							if votes > len(rf.peers)/2 && rf.state == Candidate {
 
 								rf.state = Leader
-
 								rf.heartbeat.Reset(0)
+
 								// 当选为leader之后立刻发一次心跳告诉所有人
 
 								for j := range rf.peers {
 									rf.nextIndex[j] = len(rf.log) //立刻更新对齐数
-									if j != rf.me {
-										go func(peer int) {
-											next := rf.nextIndex[peer]
-											prevIndex := next - 1
-
-											var prevTerm int
-
-											if prevIndex >= 0 {
-												prevTerm = rf.log[prevIndex].Term
-											}
-
-											args := &HeartbeatArgs{
-												LeaderId:          rf.me,
-												LeaderTerm:        rf.currentTerm,
-												Entries:           rf.log[rf.nextIndex[peer]:], //只发送未同步的日志
-												PreLogIndex:       prevIndex,
-												PreLogTerm:        prevTerm,
-												LeaderCommitIndex: rf.commitIndex,
-											}
-											reply := &HeartbeatReply{}
-											rf.SendAppendEntries(peer, args, reply)
-
-										}(j)
-									}
 								}
+								// 	if j != rf.me {
+								// 		go func(peer int) {
+
+								// 			rf.mu.Lock()
+								// 			defer rf.mu.Unlock()
+								// 			next := rf.nextIndex[peer]
+								// 			prevIndex := next - 1
+
+								// 			var prevTerm int
+
+								// 			if prevIndex >= 0 {
+								// 				prevTerm = rf.log[prevIndex].Term
+								// 			}
+
+								// 			entries := make([]LogInf, len(rf.log[rf.nextIndex[peer]:]))
+								// 			copy(entries, rf.log[rf.nextIndex[peer]:])
+
+								// 			args := &HeartbeatArgs{
+								// 				LeaderId:          rf.me,
+								// 				LeaderTerm:        rf.currentTerm,
+								// 				Entries:           entries, //只发送未同步的日志
+								// 				PreLogIndex:       prevIndex,
+								// 				PreLogTerm:        prevTerm,
+								// 				LeaderCommitIndex: rf.commitIndex,
+								// 			}
+								// 			reply := &HeartbeatReply{}
+								// 			rf.SendAppendEntries(peer, args, reply)
+
+								// 		}(j)
+								// 	}
+								// }
 							}
+							rf.mu.Unlock()
 						}
 					}(i)
 				}
@@ -473,10 +502,13 @@ func (rf *Raft) ticker() {
 								prevTerm = rf.log[prevIndex].Term
 							}
 
+							entries := make([]LogInf, len(rf.log[rf.nextIndex[i]:]))
+							copy(entries, rf.log[rf.nextIndex[i]:])
+
 							args := &HeartbeatArgs{
 								LeaderId:          rf.me,
 								LeaderTerm:        rf.currentTerm,
-								Entries:           rf.log[rf.nextIndex[i]:], //只发送未同步的日志
+								Entries:           entries, //只发送未同步的日志
 								PreLogIndex:       prevIndex,
 								PreLogTerm:        prevTerm,
 								LeaderCommitIndex: rf.commitIndex,
@@ -528,6 +560,7 @@ func (rf *Raft) ticker() {
 								rf.currentTerm = reply.Term
 								rf.state = Follower
 								rf.VoteFor = -1
+								rf.persist()
 							}
 
 						}(n)
