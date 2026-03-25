@@ -122,9 +122,33 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 		// leader 还没日志，直接覆盖
 		rf.log = args.Entries
 	} else {
-		rf.log = rf.log[:args.PreLogIndex+1]
-		rf.log = append(rf.log, args.Entries...) //同步日志
+		//查重
+		index := args.PreLogIndex + 1
+
+		for i, entry := range args.Entries {
+			if index+i < len(rf.log) {
+				if rf.log[index+i].Term != entry.Term { //发生冲突
+
+					rf.log = rf.log[:index+i] //从当前开始覆盖后面所有
+					rf.log = append(rf.log, args.Entries[i:]...)
+					break
+				}
+			} else {
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+		}
+
+		// rf.log = rf.log[:args.PreLogIndex+1]
+		// rf.log = append(rf.log, args.Entries...) //同步日志
 	}
+
+	// if len(args.Entries) > 0 {
+	// 	newLen := args.PreLogIndex + len(args.Entries) + 1
+	// 	if newLen < len(rf.log) {
+	// 		rf.log = rf.log[:newLen]
+	// 	}
+	// }
 
 	reply.Success = true
 	reply.Term = rf.currentTerm
@@ -200,6 +224,9 @@ type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
 	Term        int // 候选人当前的任期号
 	CandidateId int // 请求选票的候选人ID（服务器的索引）
+
+	LastLogIndex int //最新日志index
+	LastLogTerm  int //最新日志term
 }
 
 // example RequestVote RPC reply structure.
@@ -216,6 +243,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	reply.IsVote = 0
+
+	upToDate := false
+	lastIndex := len(rf.log) - 1
+	lastTerm := rf.log[lastIndex].Term
+
+	if args.LastLogTerm > lastTerm || (args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex) {
+		upToDate = true
+	}
+
 	if args.Term > rf.currentTerm { //版本号大了，更新版本号，清空投票
 		rf.currentTerm = args.Term
 		rf.VoteFor = -1
@@ -229,7 +265,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if args.Term == rf.currentTerm &&
-		(rf.VoteFor == -1 || rf.VoteFor == args.CandidateId) { //版本号相同，未投票
+		(rf.VoteFor == -1 || rf.VoteFor == args.CandidateId) && upToDate { //版本号相同，未投票
 
 		rf.VoteFor = args.CandidateId
 		reply.IsVote = 1
@@ -346,8 +382,10 @@ func (rf *Raft) ticker() {
 
 					go func(server int) {
 						args := &RequestVoteArgs{
-							Term:        term,
-							CandidateId: me,
+							Term:         term,
+							CandidateId:  me,
+							LastLogIndex: len(rf.log) - 1,
+							LastLogTerm:  rf.log[len(rf.log)-1].Term,
 						}
 						reply := &RequestVoteReply{}
 
@@ -459,9 +497,14 @@ func (rf *Raft) ticker() {
 							}
 
 							if reply.Success {
-								rf.nextIndex[i] = args.PreLogIndex + len(args.Entries) + 1
-								//成功对齐日志，记录成功数
-								rf.matchIndex[i] = rf.nextIndex[i] - 1
+								if len(args.Entries) > 0 {
+
+									rf.nextIndex[i] = args.PreLogIndex + len(args.Entries) + 1
+									//成功对齐日志，记录成功数
+									rf.matchIndex[i] = args.PreLogIndex + len(args.Entries)
+								} else {
+									rf.nextIndex[i] = args.PreLogIndex + 1
+								}
 								for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
 
 									count := 1 // leader 自己
@@ -532,7 +575,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	//按照commitindex commit command
 	go func() {
 		for {
 			var msgs []raftapi.ApplyMsg
