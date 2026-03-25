@@ -71,11 +71,12 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 type HeartbeatArgs struct {
-	LeaderId    int
-	LeaderTerm  int
-	Entries     []LogInf
-	PreLogIndex int //最后对齐位置
-	PreLogTerm  int //最后对齐位置的任期
+	LeaderId          int
+	LeaderTerm        int
+	Entries           []LogInf
+	PreLogIndex       int //最后对齐位置
+	PreLogTerm        int //最后对齐位置的任期
+	LeaderCommitIndex int
 }
 
 type HeartbeatReply struct {
@@ -112,6 +113,11 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 		reply.Success = false
 		return
 	}
+
+	if args.LeaderCommitIndex > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommitIndex, len(rf.log)-1)
+	}
+
 	if args.PreLogIndex < 0 {
 		// leader 还没日志，直接覆盖
 		rf.log = args.Entries
@@ -297,7 +303,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.log = append(rf.log, newcomm)
 
-	return index - 1, term, isleader
+	return index, term, isleader
 }
 
 // 无限循环接受心跳，心跳失败发送选举
@@ -377,7 +383,7 @@ func (rf *Raft) ticker() {
 								// 当选为leader之后立刻发一次心跳告诉所有人
 
 								for j := range rf.peers {
-									rf.nextIndex[j] = len(rf.log)
+									rf.nextIndex[j] = len(rf.log) //立刻更新对齐数
 									if j != rf.me {
 										go func(peer int) {
 											next := rf.nextIndex[peer]
@@ -390,11 +396,12 @@ func (rf *Raft) ticker() {
 											}
 
 											args := &HeartbeatArgs{
-												LeaderId:    rf.me,
-												LeaderTerm:  rf.currentTerm,
-												Entries:     rf.log[rf.nextIndex[peer]:], //只发送未同步的日志
-												PreLogIndex: prevIndex,
-												PreLogTerm:  prevTerm,
+												LeaderId:          rf.me,
+												LeaderTerm:        rf.currentTerm,
+												Entries:           rf.log[rf.nextIndex[peer]:], //只发送未同步的日志
+												PreLogIndex:       prevIndex,
+												PreLogTerm:        prevTerm,
+												LeaderCommitIndex: rf.commitIndex,
 											}
 											reply := &HeartbeatReply{}
 											rf.SendAppendEntries(peer, args, reply)
@@ -429,11 +436,12 @@ func (rf *Raft) ticker() {
 							}
 
 							args := &HeartbeatArgs{
-								LeaderId:    rf.me,
-								LeaderTerm:  rf.currentTerm,
-								Entries:     rf.log[rf.nextIndex[i]:], //只发送未同步的日志
-								PreLogIndex: prevIndex,
-								PreLogTerm:  prevTerm,
+								LeaderId:          rf.me,
+								LeaderTerm:        rf.currentTerm,
+								Entries:           rf.log[rf.nextIndex[i]:], //只发送未同步的日志
+								PreLogIndex:       prevIndex,
+								PreLogTerm:        prevTerm,
+								LeaderCommitIndex: rf.commitIndex,
 							}
 							rf.mu.Unlock()
 
@@ -515,6 +523,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 	rf.commitIndex = -1
 	rf.lastApplied = -1
+	rf.log = []LogInf{{Term: 0}}
 	rf.overElectiontime = time.NewTimer(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 	rf.heartbeat = time.NewTimer(50 * time.Millisecond)
 	//rf.heartbeat
