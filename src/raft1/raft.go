@@ -82,8 +82,9 @@ type HeartbeatArgs struct {
 }
 
 type HeartbeatReply struct {
-	Success bool
-	Term    int
+	Success       bool
+	Term          int
+	ConflictIndex int //冲突位置
 }
 
 func (rf *Raft) broadcastAppendEntries() {
@@ -96,12 +97,16 @@ func (rf *Raft) broadcastAppendEntries() {
 			rf.mu.Lock()
 			next := rf.nextIndex[peer]
 			prevIndex := next - 1
+
 			var prevTerm int
+
 			if prevIndex >= 0 {
 				prevTerm = rf.log[prevIndex].Term
 			}
+
 			entries := make([]LogInf, len(rf.log[next:]))
 			copy(entries, rf.log[next:])
+
 			args := &HeartbeatArgs{
 				LeaderId:          rf.me,
 				LeaderTerm:        rf.currentTerm,
@@ -120,10 +125,23 @@ func (rf *Raft) broadcastAppendEntries() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+
+			if rf.state != Leader || args.LeaderTerm != rf.currentTerm {
+				return
+			}
+
+			// if !reply.Success {
+			// 	rf.nextIndex[peer] = reply.ConflictIndex
+			// }
 			if reply.Success {
-				rf.nextIndex[peer] = args.PreLogIndex + len(args.Entries) + 1
-				rf.matchIndex[peer] = args.PreLogIndex + len(args.Entries)
-				// 更新 commitIndex
+				if len(args.Entries) > 0 {
+
+					rf.nextIndex[peer] = args.PreLogIndex + len(args.Entries) + 1
+					//成功对齐日志，记录成功数
+					rf.matchIndex[peer] = args.PreLogIndex + len(args.Entries)
+				} else {
+					rf.nextIndex[peer] = args.PreLogIndex + 1
+				}
 				for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
 					count := 1
 					for j := range rf.peers {
@@ -137,7 +155,15 @@ func (rf *Raft) broadcastAppendEntries() {
 					}
 				}
 			} else {
-				rf.nextIndex[peer] = max(0, rf.nextIndex[peer]-1)
+				// rf.nextIndex[peer] = max(0, rf.nextIndex[peer]-1)
+				rf.nextIndex[peer] = reply.ConflictIndex
+				if rf.nextIndex[peer] > len(rf.log) {
+					rf.nextIndex[peer] = len(rf.log)
+				}
+
+				// if rf.nextIndex[peer] < 1 {
+				// 	rf.nextIndex[peer] = 1
+				// }
 			}
 
 			if reply.Term > rf.currentTerm {
@@ -157,6 +183,7 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 	if args.LeaderTerm < rf.currentTerm { //leader任期落后
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		reply.ConflictIndex = len(rf.log)
 		return
 	}
 
@@ -172,12 +199,20 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 	if args.PreLogIndex >= len(rf.log) {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		reply.ConflictIndex = len(rf.log)
 		return
 	}
 
 	if args.PreLogIndex >= 0 && rf.log[args.PreLogIndex].Term != args.PreLogTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		index := args.PreLogIndex
+
+		conflictTerm := rf.log[args.PreLogIndex].Term
+		for index >= 0 && rf.log[index].Term == conflictTerm {
+			index--
+		}
+		reply.ConflictIndex = index + 1
 		return
 	}
 
@@ -185,41 +220,42 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 		rf.commitIndex = min(args.LeaderCommitIndex, len(rf.log)-1)
 	}
 
-	if args.PreLogIndex < 0 {
-		// leader 还没日志，直接覆盖
-		rf.log = args.Entries
-		rf.persist()
-	} else {
-		//查重
-		index := args.PreLogIndex + 1
+	// if args.PreLogIndex <= 0 {
+	// 	// leader 还没日志，直接覆盖
+	// 	rf.log = append([]LogInf{{Term: 0}}, args.Entries...)
+	// 	rf.persist()
+	// } else {
+	//查重
+	index := args.PreLogIndex + 1
 
-		for i, entry := range args.Entries {
-			if index+i < len(rf.log) {
-				if rf.log[index+i].Term != entry.Term { //发生冲突
+	for i, entry := range args.Entries {
+		if index+i < len(rf.log) {
+			if rf.log[index+i].Term != entry.Term { //发生冲突
 
-					rf.log = rf.log[:index+i] //从当前开始覆盖后面所有
-					rf.log = append(rf.log, args.Entries[i:]...)
-					rf.persist()
-					break
-				}
-			} else {
+				rf.log = rf.log[:index+i] //从当前开始覆盖后面所有
 				rf.log = append(rf.log, args.Entries[i:]...)
 				rf.persist()
 				break
 			}
-
+		} else {
+			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
+			break
 		}
+
+		// }
 
 		// rf.log = rf.log[:args.PreLogIndex+1]
 		// rf.log = append(rf.log, args.Entries...) //同步日志
 	}
 
-	// if len(args.Entries) > 0 {
-	// 	newLen := args.PreLogIndex + len(args.Entries) + 1
-	// 	if newLen < len(rf.log) {
-	// 		rf.log = rf.log[:newLen]
-	// 	}
-	// }
+	if len(args.Entries) > 0 {
+		newLen := args.PreLogIndex + len(args.Entries) + 1
+		if newLen < len(rf.log) {
+			rf.log = rf.log[:newLen]
+		}
+	}
+
 	rf.persist()
 	reply.Success = true
 	reply.Term = rf.currentTerm
@@ -552,85 +588,86 @@ func (rf *Raft) ticker() {
 
 			select {
 			case <-rf.heartbeat.C:
-				// count := 1
-				for n := range rf.peers {
-					if n != rf.me { //给除自己以外的所有发送心跳
-						go func(i int) {
+				rf.broadcastAppendEntries() //心跳
+				// // count := 1
+				// for n := range rf.peers {
+				// 	if n != rf.me { //给除自己以外的所有发送心跳
+				// 		go func(i int) {
 
-							rf.mu.Lock()
-							next := rf.nextIndex[i]
-							prevIndex := next - 1
+				// 			rf.mu.Lock()
+				// 			next := rf.nextIndex[i]
+				// 			prevIndex := next - 1
 
-							var prevTerm int
+				// 			var prevTerm int
 
-							if prevIndex >= 0 {
-								prevTerm = rf.log[prevIndex].Term
-							}
+				// 			if prevIndex >= 0 {
+				// 				prevTerm = rf.log[prevIndex].Term
+				// 			}
 
-							entries := make([]LogInf, len(rf.log[rf.nextIndex[i]:]))
-							copy(entries, rf.log[rf.nextIndex[i]:])
+				// 			entries := make([]LogInf, len(rf.log[rf.nextIndex[i]:]))
+				// 			copy(entries, rf.log[rf.nextIndex[i]:])
 
-							args := &HeartbeatArgs{
-								LeaderId:          rf.me,
-								LeaderTerm:        rf.currentTerm,
-								Entries:           entries, //只发送未同步的日志
-								PreLogIndex:       prevIndex,
-								PreLogTerm:        prevTerm,
-								LeaderCommitIndex: rf.commitIndex,
-							}
-							rf.mu.Unlock()
+				// 			args := &HeartbeatArgs{
+				// 				LeaderId:          rf.me,
+				// 				LeaderTerm:        rf.currentTerm,
+				// 				Entries:           entries, //只发送未同步的日志
+				// 				PreLogIndex:       prevIndex,
+				// 				PreLogTerm:        prevTerm,
+				// 				LeaderCommitIndex: rf.commitIndex,
+				// 			}
+				// 			rf.mu.Unlock()
 
-							reply := &HeartbeatReply{}
-							ok := rf.SendAppendEntries(i, args, reply)
-							if !ok {
-								return
-							}
+				// 			reply := &HeartbeatReply{}
+				// 			ok := rf.SendAppendEntries(i, args, reply)
+				// 			if !ok {
+				// 				return
+				// 			}
 
-							rf.mu.Lock()
-							defer rf.mu.Unlock()
+				// 			rf.mu.Lock()
+				// 			defer rf.mu.Unlock()
 
-							if rf.state != Leader || args.LeaderTerm != rf.currentTerm {
-								return
-							}
+				// 			if rf.state != Leader || args.LeaderTerm != rf.currentTerm {
+				// 				return
+				// 			}
 
-							if reply.Success {
-								if len(args.Entries) > 0 {
+				// 			if reply.Success {
+				// 				if len(args.Entries) > 0 {
 
-									rf.nextIndex[i] = args.PreLogIndex + len(args.Entries) + 1
-									//成功对齐日志，记录成功数
-									rf.matchIndex[i] = args.PreLogIndex + len(args.Entries)
-								} else {
-									rf.nextIndex[i] = args.PreLogIndex + 1
-								}
-								for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+				// 					rf.nextIndex[i] = args.PreLogIndex + len(args.Entries) + 1
+				// 					//成功对齐日志，记录成功数
+				// 					rf.matchIndex[i] = args.PreLogIndex + len(args.Entries)
+				// 				} else {
+				// 					rf.nextIndex[i] = args.PreLogIndex + 1
+				// 				}
+				// 				for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
 
-									count := 1 // leader 自己
+				// 					count := 1 // leader 自己
 
-									for j := range rf.peers {
-										if j != rf.me && rf.matchIndex[j] >= N {
-											count++
-										}
-									}
+				// 					for j := range rf.peers {
+				// 						if j != rf.me && rf.matchIndex[j] >= N {
+				// 							count++
+				// 						}
+				// 					}
 
-									if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
-										rf.commitIndex = N
-										break
-									}
-								}
-							} else {
-								rf.nextIndex[i] = max(0, rf.nextIndex[i]-1) //找最后一个一样的节点
-							}
+				// 					if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
+				// 						rf.commitIndex = N
+				// 						break
+				// 					}
+				// 				}
+				// 			} else {
+				// 				rf.nextIndex[i] = max(0, rf.nextIndex[i]-1) //找最后一个一样的节点
+				// 			}
 
-							if reply.Term > rf.currentTerm { //自己的任期号小了，别人是leader
-								rf.currentTerm = reply.Term
-								rf.state = Follower
-								rf.VoteFor = -1
-								rf.persist()
-							}
+				// 			if reply.Term > rf.currentTerm { //自己的任期号小了，别人是leader
+				// 				rf.currentTerm = reply.Term
+				// 				rf.state = Follower
+				// 				rf.VoteFor = -1
+				// 				rf.persist()
+				// 			}
 
-						}(n)
-					}
-				}
+				// 		}(n)
+				// 	}
+				// }
 				rf.heartbeat.Reset(50 * time.Millisecond)
 			default:
 				time.Sleep(10 * time.Millisecond)
@@ -678,7 +715,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for {
 			var msgs []raftapi.ApplyMsg
 			rf.mu.Lock()
-			for rf.lastApplied < rf.commitIndex {
+			for rf.lastApplied < rf.commitIndex && rf.lastApplied+1 < len(rf.log) {
 				rf.lastApplied++
 				msgs = append(msgs, raftapi.ApplyMsg{
 					CommandValid: true,
