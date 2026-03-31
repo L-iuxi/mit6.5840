@@ -53,6 +53,11 @@ type Raft struct {
 	matchIndex  []int
 
 	lastApplied int //上次commit
+
+	lastSnapIndex int //上次截断位置
+	lastSnapTerm  int //最后截断的任期
+	snap          []byte
+	applyCh       chan raftapi.ApplyMsg
 }
 
 // 获取当前节点任期与是否是leader
@@ -87,6 +92,107 @@ type HeartbeatReply struct {
 	ConflictIndex int //冲突位置
 }
 
+type InstallSnapshotArgs struct {
+	Term          int
+	LeaderId      int
+	LastSnapIndex int
+	LastSnapTerm  int
+	Data          []byte //snap内容
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) sendInstallSnapshot(peer int) {
+	rf.mu.Lock()
+	data := make([]byte, len(rf.snap))
+	copy(data, rf.snap)
+
+	args := InstallSnapshotArgs{
+		Term:          rf.currentTerm,
+		LeaderId:      rf.me,
+		LastSnapIndex: rf.lastSnapIndex,
+		LastSnapTerm:  rf.lastSnapTerm,
+		Data:          data,
+	}
+
+	rf.mu.Unlock()
+	reply := InstallSnapshotReply{}
+	ok := rf.peers[peer].Call("Raft.InstallSnapshot", &args, &reply)
+
+	if !ok {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.state = Follower
+		rf.persist()
+		return
+	}
+	rf.nextIndex[peer] = rf.lastSnapIndex + 1
+	rf.matchIndex[peer] = rf.lastSnapIndex
+
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	rf.state = Follower
+	rf.currentTerm = args.Term
+	rf.persist()
+
+	if args.LastSnapIndex <= rf.lastSnapIndex {
+		return
+	}
+
+	oldSnapIndex := rf.lastSnapIndex
+
+	if args.LastSnapIndex < rf.getLastIndex() {
+		rf.log = rf.log[args.LastSnapIndex-oldSnapIndex:]
+	} else { //丢弃旧log
+		rf.log = []LogInf{{Term: args.LastSnapTerm}}
+	}
+
+	rf.lastSnapIndex = args.LastSnapIndex
+	rf.lastSnapTerm = args.LastSnapTerm
+
+	rf.commitIndex = max(rf.commitIndex, rf.lastSnapIndex)
+	rf.lastApplied = max(rf.lastApplied, rf.lastSnapIndex)
+
+	rf.snap = make([]byte, len(args.Data))
+	copy(rf.snap, args.Data)
+
+	rf.persister.Save(rf.encodeState(), rf.snap)
+
+	go func() {
+		rf.applyCh <- raftapi.ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotIndex: args.LastSnapIndex,
+			SnapshotTerm:  args.LastSnapTerm,
+		}
+	}()
+}
+
+func (rf *Raft) getRealIndex(i int) int {
+	return i - rf.lastSnapIndex
+}
+
+func (rf *Raft) getLastIndex() int {
+	return rf.lastSnapIndex + len(rf.log) - 1
+}
+
 func (rf *Raft) broadcastAppendEntries() {
 	for i := range rf.peers {
 		if i == rf.me {
@@ -100,12 +206,23 @@ func (rf *Raft) broadcastAppendEntries() {
 
 			var prevTerm int
 
+			if prevIndex < rf.lastSnapIndex {
+				rf.mu.Unlock()
+				rf.sendInstallSnapshot(peer)
+				return
+			}
 			if prevIndex >= 0 {
-				prevTerm = rf.log[prevIndex].Term
+				prevTerm = rf.log[prevIndex-rf.lastSnapIndex].Term
 			}
 
-			entries := make([]LogInf, len(rf.log[next:]))
-			copy(entries, rf.log[next:])
+			if next <= rf.lastSnapIndex { //日志同步落后于最后截断的快照，发送一整个快照过去
+				rf.sendInstallSnapshot(peer)
+				rf.mu.Unlock()
+				return //发快照就不发心跳
+			}
+
+			entries := make([]LogInf, len(rf.log[next-rf.lastSnapIndex:]))
+			copy(entries, rf.log[next-rf.lastSnapIndex:])
 
 			args := &HeartbeatArgs{
 				LeaderId:          rf.me,
@@ -130,9 +247,6 @@ func (rf *Raft) broadcastAppendEntries() {
 				return
 			}
 
-			// if !reply.Success {
-			// 	rf.nextIndex[peer] = reply.ConflictIndex
-			// }
 			if reply.Success {
 				if len(args.Entries) > 0 {
 
@@ -142,28 +256,28 @@ func (rf *Raft) broadcastAppendEntries() {
 				} else {
 					rf.nextIndex[peer] = args.PreLogIndex + 1
 				}
-				for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+				for N := rf.getLastIndex(); N > rf.commitIndex; N-- {
+					if N <= rf.lastSnapIndex {
+						continue
+					}
 					count := 1
 					for j := range rf.peers {
 						if j != rf.me && rf.matchIndex[j] >= N {
 							count++
 						}
 					}
-					if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
+					if count > len(rf.peers)/2 && rf.log[N-rf.lastSnapIndex].Term == rf.currentTerm {
 						rf.commitIndex = N
 						break
 					}
 				}
 			} else {
-				// rf.nextIndex[peer] = max(0, rf.nextIndex[peer]-1)
+
 				rf.nextIndex[peer] = reply.ConflictIndex
-				if rf.nextIndex[peer] > len(rf.log) {
-					rf.nextIndex[peer] = len(rf.log)
+				if rf.nextIndex[peer] > rf.getLastIndex()+1 {
+					rf.nextIndex[peer] = rf.getLastIndex() + 1
 				}
 
-				// if rf.nextIndex[peer] < 1 {
-				// 	rf.nextIndex[peer] = 1
-				// }
 			}
 
 			if reply.Term > rf.currentTerm {
@@ -180,6 +294,7 @@ func (rf *Raft) broadcastAppendEntries() {
 func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	if args.LeaderTerm < rf.currentTerm { //leader任期落后
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -196,37 +311,43 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 	}
 	rf.state = Follower
 
-	if args.PreLogIndex >= len(rf.log) {
+	if args.PreLogIndex > rf.getLastIndex() {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		reply.ConflictIndex = len(rf.log)
+		reply.ConflictIndex = rf.getLastIndex()
 		return
 	}
 
-	if args.PreLogIndex >= 0 && rf.log[args.PreLogIndex].Term != args.PreLogTerm {
+	if args.PreLogIndex < rf.lastSnapIndex {
+		reply.Success = false
+		reply.ConflictIndex = rf.lastSnapIndex + 1
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	if args.PreLogIndex >= 0 && rf.log[args.PreLogIndex-rf.lastSnapIndex].Term != args.PreLogTerm { //发生冲突，找到冲突位置
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		index := args.PreLogIndex
 
-		conflictTerm := rf.log[args.PreLogIndex].Term
-		for index >= 0 && rf.log[index].Term == conflictTerm {
+		conflictTerm := rf.log[args.PreLogIndex-rf.lastSnapIndex].Term
+		for index >= 0 && rf.log[index-rf.lastSnapIndex].Term == conflictTerm {
 			index--
 		}
 		reply.ConflictIndex = index + 1
 		return
 	}
 
-	if args.LeaderCommitIndex > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommitIndex, len(rf.log)-1)
+	if args.LeaderCommitIndex > rf.commitIndex { //leader比自己先提交
+		rf.commitIndex = min(args.LeaderCommitIndex, rf.getLastIndex())
 	}
 
-	// if args.PreLogIndex <= 0 {
-	// 	// leader 还没日志，直接覆盖
-	// 	rf.log = append([]LogInf{{Term: 0}}, args.Entries...)
-	// 	rf.persist()
-	// } else {
-	//查重
-	index := args.PreLogIndex + 1
+	// if args.PreLogIndex < rf.lastSnapIndex { //读取到snap截断前的日志
+	// 	reply.Success = false
+	// 	return
+	// }
+
+	index := args.PreLogIndex - rf.lastSnapIndex + 1
 
 	for i, entry := range args.Entries {
 		if index+i < len(rf.log) {
@@ -242,11 +363,6 @@ func (rf *Raft) AppendEntries(args *HeartbeatArgs, reply *HeartbeatReply) {
 			rf.persist()
 			break
 		}
-
-		// }
-
-		// rf.log = rf.log[:args.PreLogIndex+1]
-		// rf.log = append(rf.log, args.Entries...) //同步日志
 	}
 
 	if len(args.Entries) > 0 {
@@ -274,17 +390,24 @@ func (rf *Raft) SendAppendEntries(server int, args *HeartbeatArgs, reply *Heartb
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-// 持久化保存当前raft状态，防止节点崩溃
-func (rf *Raft) persist() {
+
+func (rf *Raft) encodeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+
 	e.Encode(rf.log)
 	e.Encode(rf.VoteFor)
 	e.Encode(rf.currentTerm)
+	e.Encode(rf.lastSnapIndex)
+	e.Encode(rf.lastSnapTerm)
 
-	raftState := w.Bytes()
-	rf.persister.Save(raftState, nil)
+	return w.Bytes()
+}
 
+// 持久化保存当前raft状态，防止节点崩溃
+func (rf *Raft) persist() {
+	state := rf.encodeState()
+	rf.persister.Save(state, rf.snap)
 }
 
 // 解码持久化信息
@@ -299,13 +422,17 @@ func (rf *Raft) readPersist(data []byte) {
 	var Log []LogInf
 	var Term int
 	var Vote int
+	var SnapIndex int
+	var SnapTerm int
 
-	if d.Decode(&Log) != nil || d.Decode(&Vote) != nil || d.Decode(&Term) != nil {
+	if d.Decode(&Log) != nil || d.Decode(&Vote) != nil || d.Decode(&Term) != nil || d.Decode(&SnapIndex) != nil || d.Decode(&SnapTerm) != nil {
 		//解码失败
 	} else {
 		rf.log = Log
 		rf.VoteFor = Vote
 		rf.currentTerm = Term
+		rf.lastSnapIndex = SnapIndex
+		rf.lastSnapTerm = SnapTerm
 	}
 
 }
@@ -323,7 +450,27 @@ func (rf *Raft) PersistBytes() int {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if index < rf.lastSnapIndex {
+		return
+	}
+
+	term := rf.log[index-rf.lastSnapIndex].Term
+
+	newLog := make([]LogInf, 0)
+	newLog = append(newLog, LogInf{Term: term}) // dummy
+	newLog = append(newLog, rf.log[index-rf.lastSnapIndex+1:]...)
+
+	rf.log = newLog //更新截断位置后的日志
+
+	rf.lastSnapIndex = index
+	rf.lastSnapTerm = term
+	rf.snap = snapshot
+
+	state := rf.encodeState()
+	rf.persister.Save(state, snapshot)
 
 }
 
@@ -355,8 +502,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.IsVote = 0
 
 	upToDate := false
-	lastIndex := len(rf.log) - 1
-	lastTerm := rf.log[lastIndex].Term
+	lastIndex := rf.getLastIndex()
+	lastTerm := rf.log[lastIndex-rf.lastSnapIndex].Term
 
 	if args.LastLogTerm > lastTerm || (args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex) {
 		upToDate = true
@@ -437,7 +584,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	term := rf.currentTerm
-	index := len(rf.log) //日志编号
+	index := rf.getLastIndex() + 1 //日志编号
 	isleader := true
 
 	if rf.state != Leader {
@@ -488,8 +635,8 @@ func (rf *Raft) ticker() {
 				rf.overElectiontime.Reset(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 
 				votes := 1
-				lastIndex := len(rf.log) - 1
-				lastTerm := rf.log[lastIndex].Term
+				lastIndex := rf.getLastIndex()
+				lastTerm := rf.log[lastIndex-rf.lastSnapIndex].Term
 				rf.mu.Unlock()
 
 				for i := range rf.peers {
@@ -543,39 +690,8 @@ func (rf *Raft) ticker() {
 								// 当选为leader之后立刻发一次心跳告诉所有人
 
 								for j := range rf.peers {
-									rf.nextIndex[j] = len(rf.log) //立刻更新对齐数
+									rf.nextIndex[j] = rf.getLastIndex() + 1 //立刻更新对齐数
 								}
-								// 	if j != rf.me {
-								// 		go func(peer int) {
-
-								// 			rf.mu.Lock()
-								// 			defer rf.mu.Unlock()
-								// 			next := rf.nextIndex[peer]
-								// 			prevIndex := next - 1
-
-								// 			var prevTerm int
-
-								// 			if prevIndex >= 0 {
-								// 				prevTerm = rf.log[prevIndex].Term
-								// 			}
-
-								// 			entries := make([]LogInf, len(rf.log[rf.nextIndex[peer]:]))
-								// 			copy(entries, rf.log[rf.nextIndex[peer]:])
-
-								// 			args := &HeartbeatArgs{
-								// 				LeaderId:          rf.me,
-								// 				LeaderTerm:        rf.currentTerm,
-								// 				Entries:           entries, //只发送未同步的日志
-								// 				PreLogIndex:       prevIndex,
-								// 				PreLogTerm:        prevTerm,
-								// 				LeaderCommitIndex: rf.commitIndex,
-								// 			}
-								// 			reply := &HeartbeatReply{}
-								// 			rf.SendAppendEntries(peer, args, reply)
-
-								// 		}(j)
-								// 	}
-								// }
 							}
 							rf.mu.Unlock()
 						}
@@ -589,85 +705,6 @@ func (rf *Raft) ticker() {
 			select {
 			case <-rf.heartbeat.C:
 				rf.broadcastAppendEntries() //心跳
-				// // count := 1
-				// for n := range rf.peers {
-				// 	if n != rf.me { //给除自己以外的所有发送心跳
-				// 		go func(i int) {
-
-				// 			rf.mu.Lock()
-				// 			next := rf.nextIndex[i]
-				// 			prevIndex := next - 1
-
-				// 			var prevTerm int
-
-				// 			if prevIndex >= 0 {
-				// 				prevTerm = rf.log[prevIndex].Term
-				// 			}
-
-				// 			entries := make([]LogInf, len(rf.log[rf.nextIndex[i]:]))
-				// 			copy(entries, rf.log[rf.nextIndex[i]:])
-
-				// 			args := &HeartbeatArgs{
-				// 				LeaderId:          rf.me,
-				// 				LeaderTerm:        rf.currentTerm,
-				// 				Entries:           entries, //只发送未同步的日志
-				// 				PreLogIndex:       prevIndex,
-				// 				PreLogTerm:        prevTerm,
-				// 				LeaderCommitIndex: rf.commitIndex,
-				// 			}
-				// 			rf.mu.Unlock()
-
-				// 			reply := &HeartbeatReply{}
-				// 			ok := rf.SendAppendEntries(i, args, reply)
-				// 			if !ok {
-				// 				return
-				// 			}
-
-				// 			rf.mu.Lock()
-				// 			defer rf.mu.Unlock()
-
-				// 			if rf.state != Leader || args.LeaderTerm != rf.currentTerm {
-				// 				return
-				// 			}
-
-				// 			if reply.Success {
-				// 				if len(args.Entries) > 0 {
-
-				// 					rf.nextIndex[i] = args.PreLogIndex + len(args.Entries) + 1
-				// 					//成功对齐日志，记录成功数
-				// 					rf.matchIndex[i] = args.PreLogIndex + len(args.Entries)
-				// 				} else {
-				// 					rf.nextIndex[i] = args.PreLogIndex + 1
-				// 				}
-				// 				for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
-
-				// 					count := 1 // leader 自己
-
-				// 					for j := range rf.peers {
-				// 						if j != rf.me && rf.matchIndex[j] >= N {
-				// 							count++
-				// 						}
-				// 					}
-
-				// 					if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
-				// 						rf.commitIndex = N
-				// 						break
-				// 					}
-				// 				}
-				// 			} else {
-				// 				rf.nextIndex[i] = max(0, rf.nextIndex[i]-1) //找最后一个一样的节点
-				// 			}
-
-				// 			if reply.Term > rf.currentTerm { //自己的任期号小了，别人是leader
-				// 				rf.currentTerm = reply.Term
-				// 				rf.state = Follower
-				// 				rf.VoteFor = -1
-				// 				rf.persist()
-				// 			}
-
-				// 		}(n)
-				// 	}
-				// }
 				rf.heartbeat.Reset(50 * time.Millisecond)
 			default:
 				time.Sleep(10 * time.Millisecond)
@@ -690,7 +727,6 @@ func (rf *Raft) ticker() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{}
-
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
@@ -699,34 +735,58 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 	rf.VoteFor = -1
 	rf.matchIndex = make([]int, len(peers))
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.log = []LogInf{{Term: 0}}
 	rf.overElectiontime = time.NewTimer(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 	rf.heartbeat = time.NewTimer(50 * time.Millisecond)
-	//rf.heartbeat
-	//rf.log
-	// Your initialization code here (3A, 3B, 3C).
+	rf.lastSnapIndex = 0
+	rf.lastSnapTerm = 0
+	rf.snap = persister.ReadSnapshot()
+	rf.applyCh = applyCh
+	//初始化raft
 
-	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	//按照commitindex commit command
+
 	go func() {
 		for {
-			var msgs []raftapi.ApplyMsg
 			rf.mu.Lock()
-			for rf.lastApplied < rf.commitIndex && rf.lastApplied+1 < len(rf.log) {
-				rf.lastApplied++
-				msgs = append(msgs, raftapi.ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[rf.lastApplied].Command,
-					CommandIndex: rf.lastApplied,
-				})
-			}
-			rf.mu.Unlock()
-			for _, msg := range msgs {
+
+			if rf.lastApplied < rf.lastSnapIndex {
+				// 优先 apply snapshot
+				msg := raftapi.ApplyMsg{
+					SnapshotValid: true,
+					Snapshot:      rf.snap,
+					SnapshotIndex: rf.lastSnapIndex,
+					SnapshotTerm:  rf.lastSnapTerm,
+				}
+				rf.lastApplied = rf.lastSnapIndex
+				rf.mu.Unlock()
+
 				applyCh <- msg
+				continue
 			}
+
+			if rf.lastApplied < rf.commitIndex {
+				rf.lastApplied++
+
+				if rf.lastApplied-rf.lastSnapIndex >= len(rf.log) {
+					rf.mu.Unlock()
+					continue
+				}
+
+				msg := raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied-rf.lastSnapIndex].Command,
+					CommandIndex: rf.lastApplied,
+				}
+
+				rf.mu.Unlock()
+				applyCh <- msg
+				continue
+			}
+
+			rf.mu.Unlock()
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
